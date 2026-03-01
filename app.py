@@ -38,10 +38,10 @@ if strategy_choice == "1. TQQQ RSI 40일 스윙":
     
     st.markdown(f"""
     ### 📊 전략 1. TQQQ RSI 40일 스윙 (현재 설정: {MULTIPLIER}배수)
-    * **방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 신규 매수를 전면 중단합니다.
+    * **🛡️ 방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 보유 중인 물량을 **즉시 전량 매도(긴급 손절)**하고, 이평선 위로 회복할 때까지 신규 매수를 중단합니다.
     * **매수:** RSI < 40 (**{4 * MULTIPLIER}주**) / 40~50 (**{3 * MULTIPLIER}주**) / 50~60 (**{2 * MULTIPLIER}주**) / 60~70 (**{1 * MULTIPLIER}주**) / 70 이상 (매수 안함)
     * **매도 (익절):** 평균 단가 대비 **+7.5%** 수익 도달 시 전량 매도
-    * **타임아웃 (40일 경과 시):** 수익률에 관계없이 40일이 경과하면 **무조건 전량 매도(손절)** 후 새로운 사이클을 시작합니다. (기회비용 살림)
+    * **타임아웃 (40일 경과 시):** 수익률에 관계없이 40일이 경과하면 **무조건 전량 매도(손절)** 후 새로운 사이클을 시작합니다.
     """)
 else:
     st.sidebar.subheader("🔥 라오어 무한매수법 설정")
@@ -57,10 +57,10 @@ else:
 
     st.markdown(f"""
     ### 📊 전략 2. 라오어 무한매수법 (현재 설정: {SPLITS}분할, 목표 +{TARGET_RETURN}%)
-    * **방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 기계적 매수를 일시 중단하고 현금을 아낍니다. (보유 기간 카운트는 유지됨)
-    * **매수:** 초기 자본금(${INITIAL_CAPITAL:,.0f})을 {SPLITS}등분 하여, 매일 **${INITIAL_CAPITAL/SPLITS:,.2f}** 씩 TQQQ를 기계적으로 매수합니다.
-    * **매도 (익절):** 평균 단가 대비 **+{TARGET_RETURN}%** 수익 도달 시 전량 매도 후 다음 날부터 새 사이클을 시작합니다.
-    * **원금 소진 / 타임아웃:** {SPLITS}일이 경과하여 사이클이 종료되었음에도 목표 수익률에 도달하지 못하면, **즉시 전량 매도(손절)**하고 새로운 사이클로 리셋합니다.
+    * **🛡️ 방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 보유 중인 물량을 **즉시 전량 매도(긴급 손절)**하고, 이평선 위로 회복할 때까지 기계적 매수를 중단합니다.
+    * **매수:** 초기 자본금(${INITIAL_CAPITAL:,.0f})을 {SPLITS}등분 하여, 매일 **${INITIAL_CAPITAL/SPLITS:,.2f}** 씩 TQQQ를 매수합니다.
+    * **매도 (익절):** 평균 단가 대비 **+{TARGET_RETURN}%** 수익 도달 시 전량 매도
+    * **원금 소진 / 타임아웃:** {SPLITS}일이 경과하여 사이클이 종료되었음에도 목표에 도달하지 못하면, **즉시 전량 매도(손절)**합니다.
     """)
 
 # --- 데이터 수집 ---
@@ -86,7 +86,7 @@ def fetch_data(start_date, end_date):
     return df.dropna().loc[pd.to_datetime(start_date):]
 
 # --- 고속 시뮬레이션 엔진 (무한매수 최적화용) ---
-def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
+def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct, qqq_ma_filter):
     target_return = target_rate_pct / 100.0
     daily_buy_amt = init_cash / split_cnt
     cash = init_cash
@@ -100,10 +100,17 @@ def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
     
     equity_curve = []
     
+    ma_col = None
+    if qqq_ma_filter == "120일선": ma_col = 'QQQ_MA120'
+    elif qqq_ma_filter == "150일선": ma_col = 'QQQ_MA150'
+    elif qqq_ma_filter == "200일선": ma_col = 'QQQ_MA200'
+    
     for date, row in df.iterrows():
         price = row['TQQQ']
+        qqq_price = row['QQQ']
         port_val = cash + (shares * price)
         
+        # 1. 매도 로직 (이평선 이탈 포함)
         if shares > 0:
             ret = (price - avg_price) / avg_price
             days += 1
@@ -111,7 +118,9 @@ def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
             dd = (port_val / peak_val) - 1
             mdd = min(mdd, dd)
             
-            if ret >= target_return or days >= split_cnt:
+            is_ma_broken = ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]
+            
+            if is_ma_broken or ret >= target_return or days >= split_cnt:
                 cash += shares * price
                 shares = 0.0
                 invested = 0.0
@@ -120,7 +129,11 @@ def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
                 peak_val = 0.0
                 port_val = cash
                 
-        if days < split_cnt and shares == 0 or (shares > 0):
+        # 2. 매수 로직 (이평선 필터 통과 시에만)
+        can_buy = True
+        if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]: can_buy = False
+            
+        if can_buy and days < split_cnt:
             if shares == 0: peak_val = port_val
             cost_to_spend = min(daily_buy_amt, cash)
             shares_to_buy = cost_to_spend / price
@@ -136,10 +149,9 @@ def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
                 
         equity_curve.append(port_val)
         
-    final_eq = equity_curve[-1]
-    return final_eq, mdd * 100
+    return equity_curve[-1], mdd * 100
 
-# --- 1. RSI 스윙 백테스트 엔진 (칼손절 룰 반영) ---
+# --- 1. RSI 스윙 백테스트 엔진 ---
 def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
     cash = initial_cash
     cycles = []
@@ -159,6 +171,7 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
         rsi = row['RSI']
         port_val = cash + (current_cycle['shares'] * price)
         
+        # 1. 매도 로직 (이평선 이탈 포함)
         if current_cycle['shares'] > 0:
             ret = (price - avg_price) / avg_price
             current_cycle['days'] += 1
@@ -169,11 +182,14 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
             
             sell, sell_reason = False, ""
             
-            # 🔥 핵심 변경: 존버 모드 삭제. 40일 되면 무조건 매도
-            if ret >= 0.075:
-                sell, sell_reason = True, "목표 수익(+7.5%) 달성 익절"
-            elif current_cycle['days'] >= 40:
-                sell, sell_reason = True, "40일 타임아웃 (강제 전량 매도)"
+            # 🔥 핵심 변경: QQQ 이평선 하락 이탈 시 진행 중인 사이클 즉시 전량 매도
+            if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]:
+                sell, sell_reason = True, f"이평선 하락 이탈 (QQQ < {qqq_ma_filter} 긴급 전량 손절)"
+            else:
+                if ret >= 0.075:
+                    sell, sell_reason = True, "목표 수익(+7.5%) 달성 익절"
+                elif current_cycle['days'] >= 40:
+                    sell, sell_reason = True, "40일 타임아웃 (강제 전량 매도)"
                     
             if sell:
                 cash += current_cycle['shares'] * price
@@ -192,6 +208,7 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
                 avg_price = 0.0
                 port_val = cash 
                 
+        # 2. 매수 로직
         can_buy = True
         if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]: can_buy = False
                 
@@ -247,6 +264,7 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
         qqq_price = row['QQQ']
         port_val = cash + (current_cycle['shares'] * price)
         
+        # 1. 매도 로직 (이평선 이탈 포함)
         if current_cycle['shares'] > 0:
             ret = (price - avg_price) / avg_price
             current_cycle['days'] += 1 
@@ -257,10 +275,14 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
             
             sell, sell_reason = False, ""
             
-            if ret >= target_return:
-                sell, sell_reason = True, f"목표 수익(+{target_return_pct}%) 달성 익절"
-            elif current_cycle['days'] >= splits:
-                sell, sell_reason = True, f"시간 종료({splits}일 타임아웃) 강제 손절"
+            # 🔥 핵심 변경: QQQ 이평선 하락 이탈 시 즉시 매도
+            if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]:
+                sell, sell_reason = True, f"이평선 하락 이탈 (QQQ < {qqq_ma_filter} 긴급 전량 손절)"
+            else:
+                if ret >= target_return:
+                    sell, sell_reason = True, f"목표 수익(+{target_return_pct}%) 달성 익절"
+                elif current_cycle['days'] >= splits:
+                    sell, sell_reason = True, f"시간 종료({splits}일 타임아웃) 강제 손절"
                 
             if sell:
                 cash += current_cycle['shares'] * price
@@ -279,6 +301,7 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
                 avg_price = 0.0
                 port_val = cash 
                 
+        # 2. 매수 로직
         can_buy = True
         if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]: can_buy = False
                 
@@ -305,7 +328,7 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
 # --- 백테스트 실행부 ---
 df_raw = fetch_data(BACKTEST_START, BACKTEST_END)
 
-# 최적화 로직 실행 분기
+# 최적화 로직 실행 분기 (무한매수법 전용)
 if run_optimization and strategy_choice == "2. 라오어 무한매수법":
     st.divider()
     st.subheader("🤖 AI 설정값 최적화 결과")
@@ -316,7 +339,7 @@ if run_optimization and strategy_choice == "2. 라오어 무한매수법":
         
         for s in split_range:
             for r in rate_range:
-                f_eq, mdd_val = run_fast_simulation(df_raw, INITIAL_CAPITAL, s, r)
+                f_eq, mdd_val = run_fast_simulation(df_raw, INITIAL_CAPITAL, s, r, QQQ_MA_FILTER)
                 ret_pct = ((f_eq / INITIAL_CAPITAL) - 1) * 100
                 results.append({'분할 횟수': s, '기대 수익률(%)': r, '최종 수익률(%)': ret_pct, '최대 낙폭(MDD)': mdd_val})
                 
@@ -387,7 +410,7 @@ if cur_cyc['shares'] > 0:
     
     st.info("🟢 **상태:** 사이클 매수 진행 중 (목표 수익 도달 대기)")
 else:
-    st.success("✅ 현재 모든 사이클이 익절/청산되어 **현금 100%** 보유 중입니다. 다음 매수 타점을 대기합니다.")
+    st.success("✅ 현재 모든 물량이 익절 또는 손절(현금화) 되어 **현금 100%** 보유 중입니다. 다음 타점을 대기합니다.")
 
 st.divider()
 
