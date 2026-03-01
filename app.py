@@ -12,12 +12,6 @@ warnings.filterwarnings('ignore')
 # --- 페이지 기본 설정 ---
 st.set_page_config(page_title="TQQQ RSI 스윙 퀀트 대시보드", layout="wide")
 st.title("🦅 TQQQ RSI(14) 40일 스윙 전략 백테스터")
-st.markdown("""
-**[전략 룰]** * **매수:** RSI < 40 (4주) / 40~50 (3주) / 50~60 (2주) / 60~70 (1주) / 70 이상 (매수 안함)
-* **매도 (익절):** 평균 단가 대비 **+7.5%** 수익 도달 시 전량 매도
-* **타임아웃 (40일 경과 시):** 1. 수익률 **-10% 이상 ~ +7.5% 미만** ➔ 즉시 전량 매도 (약손실 마감)
-    2. 수익률 **-10% 미만** ➔ 매수 중단 후 홀딩, **본전(0%)** 회복 시 전량 매도
-""")
 
 # --- 사이드바 설정 (사용자 입력) ---
 st.sidebar.header("⚙️ 백테스트 설정")
@@ -25,9 +19,21 @@ BACKTEST_START = st.sidebar.date_input("백테스트 시작일", datetime(2022, 
 BACKTEST_END = st.sidebar.date_input("백테스트 종료일", datetime.today())
 INITIAL_CAPITAL = st.sidebar.number_input("초기 투자 자본금 ($)", value=10000.0, step=1000.0, format="%.2f")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔥 공격력 설정 (매수 배수)")
+MULTIPLIER = st.sidebar.number_input("매수 수량 배수 (기본 1배)", min_value=1, max_value=20, value=1, step=1)
+
+# 상단 룰 설명 (배수 동적 반영)
+st.markdown(f"""
+**[전략 룰] - 현재 설정: {MULTIPLIER}배수** * **매수:** RSI < 40 (**{4 * MULTIPLIER}주**) / 40~50 (**{3 * MULTIPLIER}주**) / 50~60 (**{2 * MULTIPLIER}주**) / 60~70 (**{1 * MULTIPLIER}주**) / 70 이상 (매수 안함)
+* **매도 (익절):** 평균 단가 대비 **+7.5%** 수익 도달 시 전량 매도
+* **타임아웃 (40일 경과 시):** 1. 수익률 **-10% 이상 ~ +7.5% 미만** ➔ 즉시 전량 매도 (약손실 마감)
+    2. 수익률 **-10% 미만** ➔ 매수 중단 후 홀딩, **본전(0%)** 회복 시 전량 매도
+""")
+
 # --- 데이터 수집 및 백테스트 엔진 ---
 @st.cache_data(ttl=3600)
-def run_backtest(start_date, end_date, initial_cash):
+def run_backtest(start_date, end_date, initial_cash, multiplier):
     # RSI 계산을 위해 시작일보다 40일 전 데이터부터 수집
     fetch_start = start_date - timedelta(days=60)
     data = yf.download("TQQQ", start=fetch_start.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)['Close']
@@ -71,7 +77,7 @@ def run_backtest(start_date, end_date, initial_cash):
             ret = (price - avg_price) / avg_price
             current_cycle['days'] += 1
             
-            # 사이클 내 MDD 계산 (최고점 갱신 및 낙폭 기록)
+            # 사이클 내 MDD 계산
             current_cycle['peak_val'] = max(current_cycle['peak_val'], port_val)
             dd = (port_val / current_cycle['peak_val']) - 1
             current_cycle['mdd'] = min(current_cycle['mdd'], dd)
@@ -88,7 +94,7 @@ def run_backtest(start_date, end_date, initial_cash):
                         sell = True
                         sell_reason = "40일 타임아웃 (-10% 이상 강제 매도)"
                     else:
-                        current_cycle['status'] = 'waiting_breakeven' # 매수 중단 및 존버 돌입
+                        current_cycle['status'] = 'waiting_breakeven' 
                         
             elif current_cycle['status'] == 'waiting_breakeven':
                 if ret >= 0.0:
@@ -112,26 +118,28 @@ def run_backtest(start_date, end_date, initial_cash):
                     '매도 사유': sell_reason
                 })
                 
-                # 사이클 리셋
                 current_cycle = {
                     'start_date': None, 'invested': 0.0, 'shares': 0, 'days': 0,
                     'peak_val': 0.0, 'mdd': 0.0, 'status': 'buying'
                 }
                 avg_price = 0.0
-                port_val = cash # 매도 당일 종가 기준 포트폴리오 가치
+                port_val = cash 
                 
         # 3. 매수 로직 (buying 상태이고, 아직 40일이 안 지났을 때)
         if current_cycle['status'] == 'buying':
-            shares_to_buy = 0
+            base_shares = 0
             if pd.notna(rsi):
-                if rsi < 40: shares_to_buy = 4
-                elif 40 <= rsi < 50: shares_to_buy = 3
-                elif 50 <= rsi < 60: shares_to_buy = 2
-                elif 60 <= rsi < 70: shares_to_buy = 1
+                if rsi < 40: base_shares = 4
+                elif 40 <= rsi < 50: base_shares = 3
+                elif 50 <= rsi < 60: base_shares = 2
+                elif 60 <= rsi < 70: base_shares = 1
+                
+            # 🔥 핵심 변경: 사용자가 선택한 배수를 기본 매수량에 곱해줍니다.
+            shares_to_buy = base_shares * multiplier
                 
             if shares_to_buy > 0:
                 cost = shares_to_buy * price
-                # 현금이 부족하면 살 수 있는 만큼만 삼
+                # 현금이 부족하면 살 수 있는 만큼만 삼 (올인)
                 if cash < cost:
                     shares_to_buy = int(cash // price)
                     cost = shares_to_buy * price
@@ -146,7 +154,7 @@ def run_backtest(start_date, end_date, initial_cash):
                     current_cycle['invested'] += cost
                     avg_price = (total_cost_prev + cost) / current_cycle['shares']
                     cash -= cost
-                    port_val = cash + (current_cycle['shares'] * price) # 매수 반영 후 가치
+                    port_val = cash + (current_cycle['shares'] * price)
                     
         # 4. 일일 자산 기록
         equity_curve.append({
@@ -160,7 +168,6 @@ def run_backtest(start_date, end_date, initial_cash):
     eq_df = pd.DataFrame(equity_curve).set_index('Date')
     cyc_df = pd.DataFrame(cycles)
     
-    # 마지막 안 끝난 사이클이 있으면 상태 텍스트화
     current_status = None
     if current_cycle['shares'] > 0:
         curr_price = df['Close'].iloc[-1]
@@ -177,7 +184,8 @@ def run_backtest(start_date, end_date, initial_cash):
     return eq_df, cyc_df, current_status
 
 with st.spinner("알고리즘이 백테스트를 수행 중입니다..."):
-    eq_df, cyc_df, current_status = run_backtest(BACKTEST_START, BACKTEST_END, INITIAL_CAPITAL)
+    # 배수 파라미터를 추가로 넘겨줍니다.
+    eq_df, cyc_df, current_status = run_backtest(BACKTEST_START, BACKTEST_END, INITIAL_CAPITAL, MULTIPLIER)
 
 # --- 결과 요약 대시보드 ---
 st.subheader("📊 백테스트 종합 결과")
@@ -225,7 +233,6 @@ st.divider()
 # --- 사이클별 상세 결과 (표) ---
 st.subheader("📋 사이클별 매매 상세 내역")
 if not cyc_df.empty:
-    # 예쁜 형식으로 출력
     styled_cyc = cyc_df.copy()
     styled_cyc['투입 금액 ($)'] = styled_cyc['투입 금액 ($)'].apply(lambda x: f"${x:,.2f}")
     styled_cyc['수익 금액 ($)'] = styled_cyc['수익 금액 ($)'].apply(lambda x: f"${x:+,.2f}")
@@ -245,9 +252,7 @@ st.divider()
 # --- 자산 성장 곡선 ---
 st.subheader("📈 전체 자산 성장 곡선 및 투입 원금 변화")
 fig = go.Figure()
-# 전체 자산 평가액
 fig.add_trace(go.Scatter(x=eq_df.index, y=eq_df['Total Equity'], mode='lines', name='총 자산 (현금+주식)', line=dict(color='#8e44ad', width=2.5)))
-# 주식에 투입된 금액 (현금 제외)
 fig.add_trace(go.Scatter(x=eq_df.index, y=eq_df['Invested'], mode='lines', name='주식 투입 금액', fill='tozeroy', line=dict(color='#e74c3c', width=1.5, dash='dot')))
 
 fig.update_layout(height=500, margin=dict(l=0, r=0, t=10, b=0), yaxis_title="달러 ($)", hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
