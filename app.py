@@ -41,8 +41,7 @@ if strategy_choice == "1. TQQQ RSI 40일 스윙":
     * **방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 신규 매수를 전면 중단합니다.
     * **매수:** RSI < 40 (**{4 * MULTIPLIER}주**) / 40~50 (**{3 * MULTIPLIER}주**) / 50~60 (**{2 * MULTIPLIER}주**) / 60~70 (**{1 * MULTIPLIER}주**) / 70 이상 (매수 안함)
     * **매도 (익절):** 평균 단가 대비 **+7.5%** 수익 도달 시 전량 매도
-    * **타임아웃 (40일 경과 시):** 1. 수익률 **-10% 이상 ~ +7.5% 미만** ➔ 즉시 전량 매도 (손익 마감)
-        2. 수익률 **-10% 미만** ➔ 매수 중단 후 홀딩, **본전(0%)** 회복 시 전량 매도
+    * **타임아웃 (40일 경과 시):** 수익률에 관계없이 40일이 경과하면 **무조건 전량 매도(손절)** 후 새로운 사이클을 시작합니다. (기회비용 살림)
     """)
 else:
     st.sidebar.subheader("🔥 라오어 무한매수법 설정")
@@ -73,7 +72,7 @@ def fetch_data(start_date, end_date):
         if 'Close' in data.columns:
             data = data['Close']
     except:
-        pass # 에러 패스
+        pass 
         
     df = pd.DataFrame(index=data.index)
     df['TQQQ'] = data['TQQQ'].ffill()
@@ -86,7 +85,7 @@ def fetch_data(start_date, end_date):
     
     return df.dropna().loc[pd.to_datetime(start_date):]
 
-# --- 고속 시뮬레이션 엔진 (최적화용) ---
+# --- 고속 시뮬레이션 엔진 (무한매수 최적화용) ---
 def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
     target_return = target_rate_pct / 100.0
     daily_buy_amt = init_cash / split_cnt
@@ -124,7 +123,7 @@ def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
         if days < split_cnt and shares == 0 or (shares > 0):
             if shares == 0: peak_val = port_val
             cost_to_spend = min(daily_buy_amt, cash)
-            shares_to_buy = cost_to_spend / price # 소수점 매수 허용 (빠른 계산용)
+            shares_to_buy = cost_to_spend / price
             
             if shares_to_buy > 0:
                 cost = shares_to_buy * price
@@ -140,7 +139,7 @@ def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
     final_eq = equity_curve[-1]
     return final_eq, mdd * 100
 
-# --- 1. RSI 스윙 백테스트 엔진 ---
+# --- 1. RSI 스윙 백테스트 엔진 (칼손절 룰 반영) ---
 def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
     cash = initial_cash
     cycles = []
@@ -170,14 +169,11 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
             
             sell, sell_reason = False, ""
             
-            if current_cycle['status'] == 'buying':
-                if ret >= 0.075:
-                    sell, sell_reason = True, "목표 수익(+7.5%) 달성 익절"
-                elif current_cycle['days'] >= 40:
-                    if ret >= -0.10: sell, sell_reason = True, "40일 타임아웃 (-10% 이상 손절)"
-                    else: current_cycle['status'] = 'waiting_breakeven' 
-            elif current_cycle['status'] == 'waiting_breakeven':
-                if ret >= 0.0: sell, sell_reason = True, "존버 후 본전(0%) 도달 탈출"
+            # 🔥 핵심 변경: 존버 모드 삭제. 40일 되면 무조건 매도
+            if ret >= 0.075:
+                sell, sell_reason = True, "목표 수익(+7.5%) 달성 익절"
+            elif current_cycle['days'] >= 40:
+                sell, sell_reason = True, "40일 타임아웃 (강제 전량 매도)"
                     
             if sell:
                 cash += current_cycle['shares'] * price
@@ -309,7 +305,7 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
 # --- 백테스트 실행부 ---
 df_raw = fetch_data(BACKTEST_START, BACKTEST_END)
 
-# 💡 최적화 로직 실행 분기
+# 최적화 로직 실행 분기
 if run_optimization and strategy_choice == "2. 라오어 무한매수법":
     st.divider()
     st.subheader("🤖 AI 설정값 최적화 결과")
@@ -389,10 +385,7 @@ if cur_cyc['shares'] > 0:
     ret_color = "normal" if curr_ret >= 0 else "inverse"
     s_col4.metric("현재 수익률", f"{curr_ret*100:+.2f}%", delta_color=ret_color)
     
-    if cur_cyc['status'] == 'buying':
-        st.info("🟢 **상태:** 사이클 매수 진행 중 (목표 수익 도달 또는 타임아웃 대기 중)")
-    else:
-        st.error("🔴 **상태:** 타임아웃! 강제 존버 모드 (추가 매수 없이 본전 회복 대기 중)")
+    st.info("🟢 **상태:** 사이클 매수 진행 중 (목표 수익 도달 대기)")
 else:
     st.success("✅ 현재 모든 사이클이 익절/청산되어 **현금 100%** 보유 중입니다. 다음 매수 타점을 대기합니다.")
 
