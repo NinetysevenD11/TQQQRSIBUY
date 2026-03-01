@@ -41,12 +41,15 @@ else:
     INITIAL_CAPITAL = st.sidebar.number_input("초기 투자 자본금 ($)", value=10000.0, step=1000.0, format="%.2f")
     SPLITS = st.sidebar.number_input("분할 횟수 (기본 40일)", min_value=10, max_value=100, value=40, step=1)
     TARGET_RETURN = st.sidebar.number_input("기대 수익률 (%)", min_value=1.0, max_value=50.0, value=10.0, step=0.5)
+    # 신규 추가: 라오어 전략용 이평선 필터
+    QQQ_MA_FILTER = st.sidebar.selectbox("🛡️ 하락장 매수 중단 (QQQ 이평선)", ["사용 안 함", "120일선", "150일선", "200일선"], key="laore_ma")
     
     st.markdown(f"""
     ### 📊 전략 2. 라오어 무한매수법 (현재 설정: {SPLITS}분할, 목표 +{TARGET_RETURN}%)
+    * **방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 기계적 매수를 일시 중단하고 현금을 아낍니다. (보유 기간 카운트는 유지됨)
     * **매수:** 초기 자본금(${INITIAL_CAPITAL:,.0f})을 {SPLITS}등분 하여, 매일 **${INITIAL_CAPITAL/SPLITS:,.2f}** 씩 TQQQ를 기계적으로 매수합니다.
     * **매도 (익절):** 평균 단가 대비 **+{TARGET_RETURN}%** 수익 도달 시 전량 매도 후 다음 날부터 새 사이클을 시작합니다.
-    * **원금 소진 (Exhaustion):** {SPLITS}회의 분할 매수가 모두 끝나 원금이 소진되었음에도 목표 수익률에 도달하지 못하면, **즉시 전량 매도(손절)**하고 새로운 사이클로 리셋합니다. (영혼법 미적용 기본 백테스트)
+    * **원금 소진 / 타임아웃:** {SPLITS}일이 경과하여 사이클이 종료되었음에도 목표 수익률에 도달하지 못하면, **즉시 전량 매도(손절)**하고 새로운 사이클로 리셋합니다.
     """)
 
 # --- 데이터 수집 ---
@@ -166,7 +169,7 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
     return pd.DataFrame(equity_curve).set_index('Date'), pd.DataFrame(cycles), current_cycle, avg_price
 
 # --- 2. 라오어 무한매수법 백테스트 엔진 ---
-def run_laore_backtest(df, initial_cash, splits, target_return_pct):
+def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filter):
     daily_buy_amt = initial_cash / splits
     target_return = target_return_pct / 100.0
     
@@ -177,14 +180,21 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct):
     current_cycle = {'start_date': None, 'invested': 0.0, 'shares': 0, 'days': 0, 'peak_val': 0.0, 'mdd': 0.0, 'status': 'buying'}
     avg_price = 0.0
     
+    # 이평선 필터 컬럼 매핑
+    ma_col = None
+    if qqq_ma_filter == "120일선": ma_col = 'QQQ_MA120'
+    elif qqq_ma_filter == "150일선": ma_col = 'QQQ_MA150'
+    elif qqq_ma_filter == "200일선": ma_col = 'QQQ_MA200'
+    
     for date, row in df.iterrows():
         price = row['TQQQ']
+        qqq_price = row['QQQ']
         port_val = cash + (current_cycle['shares'] * price)
         
         # 매도 체크 (보유 중일 때)
         if current_cycle['shares'] > 0:
             ret = (price - avg_price) / avg_price
-            current_cycle['days'] += 1
+            current_cycle['days'] += 1 # 매수를 쉬더라도 보유 일수는 흘러감
             
             current_cycle['peak_val'] = max(current_cycle['peak_val'], port_val)
             dd = (port_val / current_cycle['peak_val']) - 1
@@ -195,7 +205,7 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct):
             if ret >= target_return:
                 sell, sell_reason = True, f"목표 수익(+{target_return_pct}%) 달성 익절"
             elif current_cycle['days'] >= splits:
-                sell, sell_reason = True, f"원금 소진({splits}일) 타임아웃 강제 청산"
+                sell, sell_reason = True, f"시간 종료({splits}일 타임아웃) 강제 청산"
                 
             if sell:
                 cash += current_cycle['shares'] * price
@@ -217,23 +227,29 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct):
                 avg_price = 0.0
                 port_val = cash # 오늘 팔았으니 내일부터 매수 시작
                 
-        # 매수 로직 (당일 매도가 일어나지 않았고, 분할 횟수 이내일 때)
-        if current_cycle['status'] == 'buying' and current_cycle['days'] < splits and current_cycle['shares'] == 0 or (current_cycle['shares'] > 0 and current_cycle['start_date'] != date):
-            cost_to_spend = min(daily_buy_amt, cash)
-            shares_to_buy = int(cost_to_spend // price)
-            
-            if shares_to_buy > 0:
-                cost = shares_to_buy * price
-                if current_cycle['shares'] == 0:
-                    current_cycle['start_date'] = date
-                    current_cycle['peak_val'] = port_val
-                    
-                total_cost_prev = current_cycle['shares'] * avg_price
-                current_cycle['shares'] += shares_to_buy
-                current_cycle['invested'] += cost
-                avg_price = (total_cost_prev + cost) / current_cycle['shares']
-                cash -= cost
-                port_val = cash + (current_cycle['shares'] * price)
+        # 매수 로직 (하락장 방어 필터 적용)
+        can_buy = True
+        if ma_col and pd.notna(row[ma_col]):
+            if qqq_price < row[ma_col]:
+                can_buy = False # QQQ가 이평선 아래면 무지성 매수 일시 정지
+                
+        if current_cycle['status'] == 'buying' and current_cycle['days'] < splits and can_buy:
+            if current_cycle['shares'] == 0 or (current_cycle['shares'] > 0 and current_cycle['start_date'] != date):
+                cost_to_spend = min(daily_buy_amt, cash)
+                shares_to_buy = int(cost_to_spend // price)
+                
+                if shares_to_buy > 0:
+                    cost = shares_to_buy * price
+                    if current_cycle['shares'] == 0:
+                        current_cycle['start_date'] = date
+                        current_cycle['peak_val'] = port_val
+                        
+                    total_cost_prev = current_cycle['shares'] * avg_price
+                    current_cycle['shares'] += shares_to_buy
+                    current_cycle['invested'] += cost
+                    avg_price = (total_cost_prev + cost) / current_cycle['shares']
+                    cash -= cost
+                    port_val = cash + (current_cycle['shares'] * price)
                 
         equity_curve.append({'Date': date, 'Total Equity': port_val, 'Cash': cash, 'Invested': current_cycle['invested']})
         
@@ -246,7 +262,7 @@ with st.spinner("알고리즘이 백테스트를 수행 중입니다..."):
     if strategy_choice == "1. TQQQ RSI 40일 스윙":
         eq_df, cyc_df, cur_cyc, avg_price = run_rsi_backtest(df_raw, INITIAL_CAPITAL, MULTIPLIER, QQQ_MA_FILTER)
     else:
-        eq_df, cyc_df, cur_cyc, avg_price = run_laore_backtest(df_raw, INITIAL_CAPITAL, SPLITS, TARGET_RETURN)
+        eq_df, cyc_df, cur_cyc, avg_price = run_laore_backtest(df_raw, INITIAL_CAPITAL, SPLITS, TARGET_RETURN, QQQ_MA_FILTER)
 
 # --- 결과 요약 대시보드 ---
 st.subheader("📊 백테스트 종합 결과")
