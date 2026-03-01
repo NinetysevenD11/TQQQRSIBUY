@@ -21,6 +21,14 @@ st.sidebar.markdown("---")
 BACKTEST_START = st.sidebar.date_input("백테스트 시작일", datetime(2022, 1, 1))
 BACKTEST_END = st.sidebar.date_input("백테스트 종료일", datetime.today())
 
+# --- 전역 변수 초기화 ---
+INITIAL_CAPITAL = 10000.0
+SPLITS = 40
+TARGET_RETURN = 10.0
+MULTIPLIER = 1
+QQQ_MA_FILTER = "사용 안 함"
+run_optimization = False
+
 st.sidebar.markdown("---")
 if strategy_choice == "1. TQQQ RSI 40일 스윙":
     st.sidebar.subheader("🔥 RSI 스윙 설정")
@@ -41,9 +49,13 @@ else:
     INITIAL_CAPITAL = st.sidebar.number_input("초기 투자 자본금 ($)", value=10000.0, step=1000.0, format="%.2f")
     SPLITS = st.sidebar.number_input("분할 횟수 (기본 40일)", min_value=10, max_value=100, value=40, step=1)
     TARGET_RETURN = st.sidebar.number_input("기대 수익률 (%)", min_value=1.0, max_value=50.0, value=10.0, step=0.5)
-    # 신규 추가: 라오어 전략용 이평선 필터
     QQQ_MA_FILTER = st.sidebar.selectbox("🛡️ 하락장 매수 중단 (QQQ 이평선)", ["사용 안 함", "120일선", "150일선", "200일선"], key="laore_ma")
     
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🧪 AI 백테스트 최적화")
+    st.sidebar.markdown("현재 기간 동안 **몇 분할/몇 %**로 세팅하는 것이 가장 좋았는지 시뮬레이션 합니다.")
+    run_optimization = st.sidebar.button("🚀 최적 세팅값 찾기")
+
     st.markdown(f"""
     ### 📊 전략 2. 라오어 무한매수법 (현재 설정: {SPLITS}분할, 목표 +{TARGET_RETURN}%)
     * **방어 룰:** QQQ가 **{QQQ_MA_FILTER}** 아래로 내려가면 기계적 매수를 일시 중단하고 현금을 아낍니다. (보유 기간 카운트는 유지됨)
@@ -55,8 +67,14 @@ else:
 # --- 데이터 수집 ---
 @st.cache_data(ttl=3600)
 def fetch_data(start_date, end_date):
-    fetch_start = start_date - timedelta(days=300) # MA200 계산을 위해 넉넉히 수집
-    data = yf.download(['TQQQ', 'QQQ'], start=fetch_start.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)['Close']
+    fetch_start = start_date - timedelta(days=300) 
+    try:
+        data = yf.download(['TQQQ', 'QQQ'], start=fetch_start.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), progress=False)
+        if 'Close' in data.columns:
+            data = data['Close']
+    except:
+        pass # 에러 패스
+        
     df = pd.DataFrame(index=data.index)
     df['TQQQ'] = data['TQQQ'].ffill()
     df['QQQ'] = data['QQQ'].ffill()
@@ -67,6 +85,60 @@ def fetch_data(start_date, end_date):
     df['RSI'] = ta.rsi(df['TQQQ'], length=14)
     
     return df.dropna().loc[pd.to_datetime(start_date):]
+
+# --- 고속 시뮬레이션 엔진 (최적화용) ---
+def run_fast_simulation(df, init_cash, split_cnt, target_rate_pct):
+    target_return = target_rate_pct / 100.0
+    daily_buy_amt = init_cash / split_cnt
+    cash = init_cash
+    
+    shares = 0.0
+    invested = 0.0
+    days = 0
+    avg_price = 0.0
+    peak_val = 0.0
+    mdd = 0.0
+    
+    equity_curve = []
+    
+    for date, row in df.iterrows():
+        price = row['TQQQ']
+        port_val = cash + (shares * price)
+        
+        if shares > 0:
+            ret = (price - avg_price) / avg_price
+            days += 1
+            peak_val = max(peak_val, port_val)
+            dd = (port_val / peak_val) - 1
+            mdd = min(mdd, dd)
+            
+            if ret >= target_return or days >= split_cnt:
+                cash += shares * price
+                shares = 0.0
+                invested = 0.0
+                days = 0
+                avg_price = 0.0
+                peak_val = 0.0
+                port_val = cash
+                
+        if days < split_cnt and shares == 0 or (shares > 0):
+            if shares == 0: peak_val = port_val
+            cost_to_spend = min(daily_buy_amt, cash)
+            shares_to_buy = cost_to_spend / price # 소수점 매수 허용 (빠른 계산용)
+            
+            if shares_to_buy > 0:
+                cost = shares_to_buy * price
+                total_cost_prev = shares * avg_price
+                shares += shares_to_buy
+                invested += cost
+                avg_price = (total_cost_prev + cost) / shares
+                cash -= cost
+                port_val = cash + (shares * price)
+                
+        equity_curve.append(port_val)
+        
+    final_eq = equity_curve[-1]
+    return final_eq, mdd * 100
 
 # --- 1. RSI 스윙 백테스트 엔진 ---
 def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
@@ -88,7 +160,6 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
         rsi = row['RSI']
         port_val = cash + (current_cycle['shares'] * price)
         
-        # 보유 중 매도 체크
         if current_cycle['shares'] > 0:
             ret = (price - avg_price) / avg_price
             current_cycle['days'] += 1
@@ -103,39 +174,30 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
                 if ret >= 0.075:
                     sell, sell_reason = True, "목표 수익(+7.5%) 달성 익절"
                 elif current_cycle['days'] >= 40:
-                    if ret >= -0.10:
-                        sell, sell_reason = True, "40일 타임아웃 (-10% 이상 강제 매도)"
-                    else:
-                        current_cycle['status'] = 'waiting_breakeven' 
+                    if ret >= -0.10: sell, sell_reason = True, "40일 타임아웃 (-10% 이상 손절)"
+                    else: current_cycle['status'] = 'waiting_breakeven' 
             elif current_cycle['status'] == 'waiting_breakeven':
-                if ret >= 0.0:
-                    sell, sell_reason = True, "존버 후 본전(0%) 도달 탈출"
+                if ret >= 0.0: sell, sell_reason = True, "존버 후 본전(0%) 도달 탈출"
                     
             if sell:
                 cash += current_cycle['shares'] * price
                 profit = (current_cycle['shares'] * price) - current_cycle['invested']
-                profit_pct = profit / current_cycle['invested']
-                
                 cycles.append({
                     '사이클 시작일': current_cycle['start_date'].strftime('%Y-%m-%d'),
                     '사이클 종료일': date.strftime('%Y-%m-%d'),
                     '투자 기간 (일)': current_cycle['days'],
                     '투입 금액 ($)': current_cycle['invested'],
                     '수익 금액 ($)': profit,
-                    '수익률 (%)': profit_pct * 100,
+                    '수익률 (%)': (profit / current_cycle['invested']) * 100,
                     '사이클 MDD (%)': current_cycle['mdd'] * 100,
                     '매도 사유': sell_reason
                 })
-                
                 current_cycle = {'start_date': None, 'invested': 0.0, 'shares': 0, 'days': 0, 'peak_val': 0.0, 'mdd': 0.0, 'status': 'buying'}
                 avg_price = 0.0
                 port_val = cash 
                 
-        # 매수 로직
         can_buy = True
-        if ma_col and pd.notna(row[ma_col]):
-            if qqq_price < row[ma_col]:
-                can_buy = False # QQQ가 이평선 아래면 매수 금지
+        if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]: can_buy = False
                 
         if current_cycle['status'] == 'buying' and can_buy:
             base_shares = 0
@@ -146,7 +208,6 @@ def run_rsi_backtest(df, initial_cash, multiplier, qqq_ma_filter):
                 elif 60 <= rsi < 70: base_shares = 1
                 
             shares_to_buy = base_shares * multiplier
-                
             if shares_to_buy > 0:
                 cost = shares_to_buy * price
                 if cash < cost:
@@ -180,7 +241,6 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
     current_cycle = {'start_date': None, 'invested': 0.0, 'shares': 0, 'days': 0, 'peak_val': 0.0, 'mdd': 0.0, 'status': 'buying'}
     avg_price = 0.0
     
-    # 이평선 필터 컬럼 매핑
     ma_col = None
     if qqq_ma_filter == "120일선": ma_col = 'QQQ_MA120'
     elif qqq_ma_filter == "150일선": ma_col = 'QQQ_MA150'
@@ -191,10 +251,9 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
         qqq_price = row['QQQ']
         port_val = cash + (current_cycle['shares'] * price)
         
-        # 매도 체크 (보유 중일 때)
         if current_cycle['shares'] > 0:
             ret = (price - avg_price) / avg_price
-            current_cycle['days'] += 1 # 매수를 쉬더라도 보유 일수는 흘러감
+            current_cycle['days'] += 1 
             
             current_cycle['peak_val'] = max(current_cycle['peak_val'], port_val)
             dd = (port_val / current_cycle['peak_val']) - 1
@@ -205,45 +264,37 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
             if ret >= target_return:
                 sell, sell_reason = True, f"목표 수익(+{target_return_pct}%) 달성 익절"
             elif current_cycle['days'] >= splits:
-                sell, sell_reason = True, f"시간 종료({splits}일 타임아웃) 강제 청산"
+                sell, sell_reason = True, f"시간 종료({splits}일 타임아웃) 강제 손절"
                 
             if sell:
                 cash += current_cycle['shares'] * price
                 profit = (current_cycle['shares'] * price) - current_cycle['invested']
-                profit_pct = profit / current_cycle['invested']
-                
                 cycles.append({
                     '사이클 시작일': current_cycle['start_date'].strftime('%Y-%m-%d'),
                     '사이클 종료일': date.strftime('%Y-%m-%d'),
                     '투자 기간 (일)': current_cycle['days'],
                     '투입 금액 ($)': current_cycle['invested'],
                     '수익 금액 ($)': profit,
-                    '수익률 (%)': profit_pct * 100,
+                    '수익률 (%)': (profit / current_cycle['invested']) * 100,
                     '사이클 MDD (%)': current_cycle['mdd'] * 100,
                     '매도 사유': sell_reason
                 })
-                
                 current_cycle = {'start_date': None, 'invested': 0.0, 'shares': 0, 'days': 0, 'peak_val': 0.0, 'mdd': 0.0, 'status': 'buying'}
                 avg_price = 0.0
-                port_val = cash # 오늘 팔았으니 내일부터 매수 시작
+                port_val = cash 
                 
-        # 매수 로직 (하락장 방어 필터 적용)
         can_buy = True
-        if ma_col and pd.notna(row[ma_col]):
-            if qqq_price < row[ma_col]:
-                can_buy = False # QQQ가 이평선 아래면 무지성 매수 일시 정지
+        if ma_col and pd.notna(row[ma_col]) and qqq_price < row[ma_col]: can_buy = False
                 
         if current_cycle['status'] == 'buying' and current_cycle['days'] < splits and can_buy:
             if current_cycle['shares'] == 0 or (current_cycle['shares'] > 0 and current_cycle['start_date'] != date):
                 cost_to_spend = min(daily_buy_amt, cash)
                 shares_to_buy = int(cost_to_spend // price)
-                
                 if shares_to_buy > 0:
                     cost = shares_to_buy * price
                     if current_cycle['shares'] == 0:
                         current_cycle['start_date'] = date
                         current_cycle['peak_val'] = port_val
-                        
                     total_cost_prev = current_cycle['shares'] * avg_price
                     current_cycle['shares'] += shares_to_buy
                     current_cycle['invested'] += cost
@@ -256,9 +307,47 @@ def run_laore_backtest(df, initial_cash, splits, target_return_pct, qqq_ma_filte
     return pd.DataFrame(equity_curve).set_index('Date'), pd.DataFrame(cycles), current_cycle, avg_price
 
 # --- 백테스트 실행부 ---
+df_raw = fetch_data(BACKTEST_START, BACKTEST_END)
+
+# 💡 최적화 로직 실행 분기
+if run_optimization and strategy_choice == "2. 라오어 무한매수법":
+    st.divider()
+    st.subheader("🤖 AI 설정값 최적화 결과")
+    with st.spinner("36가지 조합을 빛의 속도로 연산 중입니다... (약 2~3초 소요)"):
+        split_range = [30, 35, 40, 45, 50, 60]
+        rate_range = [5.0, 7.5, 10.0, 12.5, 15.0, 20.0]
+        results = []
+        
+        for s in split_range:
+            for r in rate_range:
+                f_eq, mdd_val = run_fast_simulation(df_raw, INITIAL_CAPITAL, s, r)
+                ret_pct = ((f_eq / INITIAL_CAPITAL) - 1) * 100
+                results.append({'분할 횟수': s, '기대 수익률(%)': r, '최종 수익률(%)': ret_pct, '최대 낙폭(MDD)': mdd_val})
+                
+        res_df = pd.DataFrame(results)
+        
+        col_o1, col_o2 = st.columns(2)
+        with col_o1:
+            st.markdown("##### 🏆 수익률(Return) 기준 Best 3")
+            top_ret = res_df.sort_values(by='최종 수익률(%)', ascending=False).head(3).reset_index(drop=True)
+            top_ret.index = top_ret.index + 1
+            st.dataframe(top_ret.style.format({'기대 수익률(%)': "{:.1f}%", '최종 수익률(%)': "{:+.2f}%", '최대 낙폭(MDD)': "{:.2f}%"}), use_container_width=True)
+            
+        with col_o2:
+            st.markdown("##### 🛡️ 안정성(MDD) 기준 Best 3 (수익권 한정)")
+            safe_df = res_df[res_df['최종 수익률(%)'] > 0]
+            if not safe_df.empty:
+                top_mdd = safe_df.sort_values(by='최대 낙폭(MDD)', ascending=False).head(3).reset_index(drop=True)
+                top_mdd.index = top_mdd.index + 1
+                st.dataframe(top_mdd.style.format({'기대 수익률(%)': "{:.1f}%", '최종 수익률(%)': "{:+.2f}%", '최대 낙폭(MDD)': "{:.2f}%"}), use_container_width=True)
+            else:
+                st.warning("선택한 기간 내에 수익을 낸 조합이 없습니다.")
+                
+    st.info("👆 위 결과를 참고하여, 왼쪽 설정창에서 분할 횟수와 기대 수익률을 직접 변경해 보세요!")
+    st.divider()
+
+# 일반 백테스트 실행
 with st.spinner("알고리즘이 백테스트를 수행 중입니다..."):
-    df_raw = fetch_data(BACKTEST_START, BACKTEST_END)
-    
     if strategy_choice == "1. TQQQ RSI 40일 스윙":
         eq_df, cyc_df, cur_cyc, avg_price = run_rsi_backtest(df_raw, INITIAL_CAPITAL, MULTIPLIER, QQQ_MA_FILTER)
     else:
